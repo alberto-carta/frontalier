@@ -1,0 +1,4 @@
+# Runtime requirements -- mirrors install_requires in setup.cfg.
+numpy>=1.18
+pymatgen>=2020.10
+matplotlib>=3.2
