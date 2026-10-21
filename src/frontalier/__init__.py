@@ -1,6 +1,6 @@
 """
-frontier_builder
-================
+frontalier
+==========
 
 Small tools to read a Quantum ESPRESSO / wannier90 dump and build local
 frontier models from it.

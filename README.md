@@ -1,4 +1,4 @@
-# frontier_builder
+# frontalier
 
 Hello world, I am wannierizing!
 
@@ -19,7 +19,7 @@ Python >= 3.8, `numpy`, `pymatgen`, `matplotlib` (see `requirements.txt`).
 ## Use
 
 ```python
-from frontier_builder import local_model, qe_dump, structure
+from frontalier import local_model, qe_dump, structure
 ```
 
 The scripts that drive the library live with the calculation they analyse, e.g.
