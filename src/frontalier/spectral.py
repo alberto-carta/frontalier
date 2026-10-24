@@ -30,6 +30,7 @@ Conventions
 
 import numpy as np
 
+from . import operators, timing
 from .qe_dump import PwDump
 
 
@@ -183,3 +184,59 @@ def integrate(grid: np.ndarray, curve: np.ndarray,
 def at_energy(grid: np.ndarray, curve: np.ndarray, energy: float) -> float:
     """Value of a spectrum at the absolute energy `energy`."""
     return float(np.interp(energy, grid, curve))
+
+
+def filled_states(dump: PwDump, mu: float, kT: float) -> float:
+    """Electrons per spin channel below `mu` at temperature `kT`."""
+    occupations = operators.fermi_dirac(dump.energies, mu, kT)
+    return float(np.sum(dump.weights[:, None] * occupations))
+
+
+def chemical_potential(dump: PwDump, electrons: float, kT: float,
+                       verbose: bool = True, xtol: float = 1e-8) -> float:
+    """The `mu` at which the bands hold `electrons` per spin channel.
+
+    An insulator does not need this: any `mu` in the gap gives the same
+    occupations.  A metal does.  The Fermi energy QE prints belongs to QE's own
+    smearing width (`degauss`, 0.02 Ry = 0.27 eV by default), and feeding it to
+    a 300 K Fermi function shifts every partially filled state near E_F; here
+    the count is made to come out right at the temperature the analysis uses.
+
+    `electrons` is the count *per spin channel*, so half of what QE prints for
+    a non-magnetic run (41 electrons in SrVO3 -> 20.5).
+
+    Brent's method (scipy) rather than bisection: the count is monotone in `mu`,
+    so it converges in ~10 evaluations instead of ~50.  Without scipy the same
+    bracket is bisected.  `verbose` prints every evaluation (default: on when
+    FRONTALIER_TIMING is set).
+    """
+    low = float(dump.energies.min()) - 1.0
+    high = float(dump.energies.max()) + 1.0
+    calls = [0]
+
+    def excess(mu):
+        calls[0] += 1
+        value = filled_states(dump, mu, kT) - electrons
+        if verbose:
+            print(f"    [{calls[0]:2d}] mu = {mu:10.5f} eV   N = "
+                  f"{value + electrons:10.5f}   ({value:+.3e})", flush=True)
+        return value
+
+    try:
+        from scipy.optimize import brentq
+        with timing.stage(f"chemical potential   ({electrons:g} electrons per "
+                          f"spin, kT = {kT} eV)"):
+            root = float(brentq(excess, low, high, xtol=xtol, maxiter=200))
+    except ImportError:                      # scipy is optional
+        timing.banner("chemical potential   (bisection, scipy missing)")
+        for _ in range(200):
+            middle = 0.5 * (low + high)
+            if excess(middle) < 0.0:
+                low = middle
+            else:
+                high = middle
+        root = 0.5 * (low + high)
+    if verbose:
+        print(f"    chemical potential {root:.6f} eV after {calls[0]} evaluations"
+              f"   (bracket {low:.4f} .. {high:.4f})", flush=True)
+    return root

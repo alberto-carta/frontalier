@@ -7,10 +7,14 @@ Everything here either builds a model (via `local_model`), prints one (via
 level and an orbital selection, then calls the functions below in order.
 """
 
+import re
+from dataclasses import dataclass
+from typing import List
+
 import numpy as np
 
-from . import (fragments, local_model, orbitals, operators, plots, report,
-               spectral, wannier)
+from . import (fragments, local_model, orbitals, operators, plots, qe_dump,
+               report, spectral, timing, wannier)
 
 
 # --------------------------------------------------------------------------
@@ -24,6 +28,11 @@ def dump_summary(dump, prefix=""):
     print(f"  k-points          {dump.nk}")
     print(f"  bands             {dump.nbnd}  (of {dump.nbands_total})")
     print(f"  orbitals          {dump.norb}")
+    if dump.nbnd < dump.norb:
+        print(f"  WARNING           {dump.norb} projectors cannot be complete in "
+              f"{dump.nbnd} bands: every weight, H(R=0) and n_occ built from "
+              f"them is an underestimate. Raise nbnd (a few hundred) in the "
+              f"nscf and re-run projwfc.")
     print(f"  sum_k w_k         {dump.weights.sum():.6f}  (per spin channel)")
     print(f"  energy range      {dump.energies.min():.3f} .. "
           f"{dump.energies.max():.3f} eV")
@@ -55,8 +64,15 @@ def hr_dat_check(dump, hr_file):
     not divide at all), so those entries are not comparable without knowing the
     writer.  Everything inside agrees to the print precision of the file.
     """
+    with timing.stage(f"H(R) check against {hr_file}"):
+        _hr_dat_check(dump, hr_file)
+
+
+def _hr_dat_check(dump, hr_file):
+    """The body of `hr_dat_check`, so the banner stays out of the way."""
     try:
         nw, reference, _ = wannier.read_hr_dat(hr_file)
+        shape = qe_dump.mesh_shape(dump)
     except (OSError, ValueError) as error:
         print(f"\n  {hr_file}: not checked ({error})")
         return
@@ -65,8 +81,9 @@ def hr_dat_check(dump, hr_file):
               f"skipping the H(R) check")
         return
 
-    half_box = round(dump.nk ** (1.0 / 3.0)) // 2
-    interior = [R for R in reference if max(abs(x) for x in R) < half_box]
+    half_box = [n // 2 for n in shape]
+    interior = [R for R in reference
+                if all(abs(R[axis]) < half_box[axis] for axis in range(3))]
     if not interior:
         print(f"\n  {hr_file}: no R vector inside the k-mesh box")
         return
@@ -98,6 +115,16 @@ def selection_table(dump, selection):
     """Which rows a shell selection picks, one line per atom-shell."""
     chosen = orbitals.select(dump.orbitals, selection)
     print(f"\nselection {selection} -> {len(chosen)} orbitals of {dump.norb}")
+    for spec in selection:
+        pattern = orbitals.parse_shell(spec)
+        if pattern[1] is None or any(orbitals.matches(o, pattern)
+                                     for o in dump.orbitals):
+            continue
+        shell = ("the shell asked for" if pattern[2] is None else
+                 f"l={orbitals.SHELL_LETTERS[pattern[2]]}")
+        print(f"  note  nothing carries n={pattern[1]} with {shell} here -- the "
+              f".amn `n` counts wavefunctions inside the pseudopotential, not "
+              f"shells -- so {spec!r} was matched on species and l only")
     for atom, shell, members in orbitals.group_by_atom_shell(dump.orbitals, chosen):
         first, last = members[0] + 1, members[-1] + 1
         span = f"{first}" if first == last else f"{first}-{last}"
@@ -121,8 +148,10 @@ def block_report(title, matrix, dump, members):
 def matrices(dump, selection, mu, kT):
     """n(R=0) and H(R=0) of a shell selection, one block per atom-shell."""
     chosen = orbitals.select(dump.orbitals, selection)
-    occupation = operators.density_matrix(dump, mu, kT)
-    hamiltonian = operators.hamiltonian(dump)
+    with timing.stage(f"n(R=0) and H(R=0) of the selection   "
+                      f"({dump.norb} orbitals, mu = {mu:.4f} eV)"):
+        occupation = operators.density_matrix(dump, mu, kT)
+        hamiltonian = operators.hamiltonian(dump)
 
     for title, matrix in ((f"n(R=0)   mu = {mu} eV, kT = {kT} eV", occupation),
                           ("H(R=0)   [eV]", hamiltonian)):
@@ -154,6 +183,19 @@ def eigenstate_table(model):
         print(f"    {column + 1:3d} {model.eigenvalues[column]:10.4f}"
               + "".join(f"{per_shell[s, column]:9.3f}"
                         for s in range(len(shells))))
+
+
+def fragment_origins(cell, origins):
+    """The origin labels of the fragments, one per atom.
+
+    A species name that names several atoms -- "Ti" in a cell with four Ti --
+    means all of them, and the expansion is printed, so the report cannot show
+    fewer fragments than the driver asked for.
+    """
+    expanded = fragments.expand_atoms(cell, origins)
+    if expanded != list(origins):
+        print(f"\n  fragment origins {list(origins)} stand for {expanded}")
+    return expanded
 
 
 def fragment_report(model, show_hamiltonian=True):
@@ -233,13 +275,87 @@ def frontier_report(model):
 # --------------------------------------------------------------------------
 #  spectral quantities: DOS / PDOS and COHP
 # --------------------------------------------------------------------------
-def _spectral_sets(dump):
-    """Orbital rows of the three shells the spectra are projected on."""
-    d_rows = orbitals.select(dump.orbitals, ["Ni 3d"])
-    p_rows = orbitals.select(dump.orbitals, ["O 2p"])
-    s_rows = [index for index, orbital in enumerate(dump.orbitals)
-              if orbital.l == 0 and orbital.species == "O"]
-    return d_rows, p_rows, s_rows
+@dataclass(frozen=True)
+class Shells:
+    """The orbital rows the spectra are projected on, and how to name them.
+
+    The species come from the data, not from a hard-coded compound: the metal
+    is the species of the fragment origins ("Ni1" -> Ni, "Fe" -> Fe) and the
+    ligand is whatever else the projectors carry, so the same report runs on
+    NiO and FeO.  The names come from the driver's own selection ("Fe 3d",
+    "O 2p"), so nothing here has to guess which quantum number the
+    pseudopotential decided to write in the `.amn` header.
+    """
+
+    metal: str
+    ligand: str
+    d_label: str
+    p_label: str
+    s_label: str
+    d_rows: List[int]
+    p_rows: List[int]
+    s_rows: List[int]
+
+
+def _species_of(name: str) -> str:
+    """'Ni1' -> 'Ni', 'Fe' -> 'Fe'."""
+    return re.sub(r"\d+$", "", name)
+
+
+def _spec_label(selection, species, letter, fallback):
+    """The spec of `selection` naming this species and shell, else `fallback`."""
+    angular = orbitals.SHELL_LETTERS.index(letter)
+    for spec in selection:
+        chosen, _, l = orbitals.parse_shell(spec)
+        if (chosen or "").lower() == species.lower() and l == angular:
+            return spec
+    return fallback
+
+
+def _shells(dump, origins, selection) -> Shells:
+    """Build the `Shells` of a dump out of its fragment origins.
+
+    The ligand is the species the driver's selection calls a p shell on
+    ("O 2p"), not "every species that is not the metal": La and Lu carry their
+    own semicore p channel, and taking those would label the O 2p panel
+    "La p" / "Lu p" and fold La 5p into the ligand DOS and COHP shares.  When
+    the selection names no such shell, the species with the most projectors
+    wins, which is the anion in every compound here.
+    """
+    metals = sorted({_species_of(origin) for origin in origins})
+    others = [orbital for orbital in dump.orbitals
+              if _species_of(orbital.species) not in metals]
+    if not others:
+        raise ValueError(f"no ligand species besides {metals} in the projectors")
+
+    ligand = None
+    for spec in selection:
+        chosen, _, l = orbitals.parse_shell(spec)
+        if chosen and l == 1 and _species_of(chosen) not in metals:
+            ligand = _species_of(chosen)
+            break
+    if ligand is None:
+        counts = {}
+        for orbital in others:
+            counts[orbital.species] = counts.get(orbital.species, 0) + 1
+        ligand = max(counts, key=counts.get)
+
+    d_rows = [orbital.index for orbital in dump.orbitals
+              if orbital.l == 2 and _species_of(orbital.species) in metals]
+    if not d_rows:
+        raise ValueError(f"no d projectors on {metals} to build a model from")
+    p_rows = [orbital.index for orbital in dump.orbitals
+              if orbital.l == 1 and _species_of(orbital.species) == ligand]
+    s_rows = [orbital.index for orbital in dump.orbitals
+              if orbital.l == 0 and _species_of(orbital.species) == ligand]
+
+    metal = metals[0]
+    return Shells(
+        metal=metal, ligand=ligand,
+        d_label=_spec_label(selection, metal, "d", f"{metal} d"),
+        p_label=_spec_label(selection, ligand, "p", f"{ligand} p"),
+        s_label=_spec_label(selection, ligand, "s", f"{ligand} s"),
+        d_rows=d_rows, p_rows=p_rows, s_rows=s_rows)
 
 
 def _dressed_columns(dump, model, count):
@@ -320,8 +436,8 @@ def _atom_weights(model, indices):
 
 
 def _comparison_report(dump, grid, mu, sigma, columns, models, groups,
-                       d_rows, p_rows, out_dir, tag):
-    """Ni 3d / O 2p above, the sub-diagonalised levels below.
+                       shells, out_dir, tag):
+    """The metal d and ligand p above, the sub-diagonalised levels below.
 
     The two panels must not be mistaken for a partition of one another.  The
     density of states of a whole block of orthonormal states is basis
@@ -332,10 +448,10 @@ def _comparison_report(dump, grid, mu, sigma, columns, models, groups,
     so the lower panel shows one curve per level.
     """
     curves = [
-        (f"Ni 3d ({len(d_rows)})",
-         spectral.projected_dos(dump, grid, sigma, d_rows), "C0", False),
-        (f"O 2p ({len(p_rows)})",
-         spectral.projected_dos(dump, grid, sigma, p_rows), "C3", False)]
+        (f"{shells.d_label} ({len(shells.d_rows)})",
+         spectral.projected_dos(dump, grid, sigma, shells.d_rows), "C0", False),
+        (f"{shells.p_label} ({len(shells.p_rows)})",
+         spectral.projected_dos(dump, grid, sigma, shells.p_rows), "C3", False)]
     total = ("total DOS", spectral.dos(dump, grid, sigma))
 
     palette = ["C1", "C4", "C2", "C5", "C0", "C3"]
@@ -353,7 +469,8 @@ def _comparison_report(dump, grid, mu, sigma, columns, models, groups,
             hybrids.append((label, curve, colour, True))
             sticks.append((levels[members], colour))
             share = float(np.mean([
-                spectral.character_split(dump, blocks[position], members, d_rows)
+                spectral.character_split(dump, blocks[position], members,
+                                         shells.d_rows)
                 for blocks in columns]))
             absolute = [groups[0][position][i] for i in members]
             atoms = _atom_weights(models[0], absolute)
@@ -369,7 +486,8 @@ def _comparison_report(dump, grid, mu, sigma, columns, models, groups,
          {"ylabel": "states / eV / cell", "curves": hybrids,
           "background": total, "sticks": sticks}],
         f"{out_dir}/{tag}_dos_compare.png",
-        "Ni 3d / O 2p (top) and the sub-diagonalised levels (bottom)", tag=tag)
+        f"{shells.d_label} / {shells.p_label} (top) and the "
+        "sub-diagonalised levels (bottom)", tag=tag)
 
     print("  sub-diagonalised levels  |  weight per atom  |  bands it sits in")
     for label, peak, weight, share, atoms in report:
@@ -377,35 +495,37 @@ def _comparison_report(dump, grid, mu, sigma, columns, models, groups,
                              for name, value in sorted(atoms.items()))
         print(f"    {label:28s} peak {peak:+6.2f} eV {weight:5.2f} e"
               f"   {per_atom}"
-              f"   ->  {100 * share:4.1f} % Ni 3d bands,"
-              f" {100 * (1 - share):4.1f} % O 2p")
+              f"   ->  {100 * share:4.1f} % {shells.d_label} bands,"
+              f" {100 * (1 - share):4.1f} % {shells.p_label}")
     return path
 
 
-def _dos_report(dump, grid, mu, sigma, d_rows, p_rows, s_rows, out_dir, tag):
-    """Total DOS with the Ni 3d and O 2p projections."""
-    groups = [(f"Ni 3d ({len(d_rows)})", d_rows, "C0"),
-              (f"O 2p ({len(p_rows)})", p_rows, "C3")]
-    if s_rows:
-        groups.append((f"O 2s ({len(s_rows)})", s_rows, "C2"))
+def _dos_report(dump, grid, mu, sigma, shells, out_dir, tag):
+    """Total DOS with the metal d and ligand p projections."""
+    groups = [(f"{shells.d_label} ({len(shells.d_rows)})", shells.d_rows, "C0"),
+              (f"{shells.p_label} ({len(shells.p_rows)})", shells.p_rows, "C3")]
+    if shells.s_rows:
+        groups.append((f"{shells.s_label} ({len(shells.s_rows)})",
+                       shells.s_rows, "C2"))
     path = plots.dos_pdos(dump, grid, mu, sigma,
                           f"{out_dir}/{tag}_dos_pdos.png", groups,
                           title="total and projected DOS", tag=tag)
 
     total = spectral.dos(dump, grid, sigma)
     values = [spectral.at_energy(grid, total, mu)]
-    for rows in (d_rows, p_rows):
+    for rows in (shells.d_rows, shells.p_rows):
         values.append(spectral.at_energy(
             grid, spectral.projected_dos(dump, grid, sigma, rows), mu))
     print(f"  DOS at E_F   total {values[0]:6.3f}"
-          f"   Ni 3d {values[1]:6.3f}   O 2p {values[2]:6.3f}"
+          f"   {shells.d_label} {values[1]:6.3f}"
+          f"   {shells.p_label} {values[2]:6.3f}"
           f"   (states / eV / cell)")
     return path
 
 
-def _cohp_report(dump, cell, grid, mu, sigma, columns, origins, d_rows, p_rows,
+def _cohp_report(dump, cell, grid, mu, sigma, columns, origins, shells,
                  out_dir, tag):
-    """Ni 3d - O 2p COHP: the total, and the share of each dressed group."""
+    """Metal d - ligand p COHP: the total, and the share of each dressed group."""
     labels = ["AB (5 most d-like)", "B (the next 5)", "remaining ligand"]
     partial = [np.zeros_like(grid) for _ in labels]
     for position, origin in enumerate(origins):
@@ -414,10 +534,10 @@ def _cohp_report(dump, cell, grid, mu, sigma, columns, origins, d_rows, p_rows,
                 if orbital.atom == atom and orbital.l == 2]
         for curve, share in zip(partial,
                                 _character_shares(dump, columns[position])):
-            curve += spectral.cohp(dump, grid, sigma, rows, p_rows,
+            curve += spectral.cohp(dump, grid, sigma, rows, shells.p_rows,
                                    weight=share)
 
-    total = spectral.cohp(dump, grid, sigma, d_rows, p_rows)
+    total = spectral.cohp(dump, grid, sigma, shells.d_rows, shells.p_rows)
 
     def icohp(curve):
         return -spectral.integrate(grid, curve, mu)
@@ -426,11 +546,13 @@ def _cohp_report(dump, cell, grid, mu, sigma, columns, origins, d_rows, p_rows,
         return f"{text}   (-ICOHP {icohp(curve):.2f} eV)"
 
     colours = ["C0", "C3", "C2"]
-    curves = [(label("total Ni 3d - O 2p", total), total, "0.15", 1.8)]
+    curves = [(label(f"total {shells.d_label} - {shells.p_label}", total),
+               total, "0.15", 1.8)]
     for name, colour, curve in zip(labels, colours, partial):
         curves.append((label(f"share of {name}", curve), curve, colour, 1.2))
     path = plots.cohp_panel(grid, mu, curves, f"{out_dir}/{tag}_cohp.png",
-                            "COHP between Ni 3d and O 2p", tag=tag)
+                            f"COHP between {shells.d_label} and {shells.p_label}",
+                            tag=tag)
 
     print(f"  -ICOHP up to E_F   total {icohp(total):7.3f} eV"
           f"   of which"
@@ -443,25 +565,41 @@ def _cohp_report(dump, cell, grid, mu, sigma, columns, origins, d_rows, p_rows,
 
 def spectral_report(dump, cell, origins, radius, selection, count, mu, kT,
                     out_dir="./plots", sigma=0.08, tag="ni",
-                    below=8.0, above=4.0):
+                    below=8.0, above=4.0, models=None, frontier=None):
     """DOS/PDOS, dressed-state DOS and COHP; saves the figures to `out_dir`.
 
     Built only from `dump.energies` and `dump.proj` (through `spectral`), so it
     works the same for a pw dump and for a Wannier run.
+
+    `models` (one fragment per origin) and `frontier` are reused when the
+    driver has already built them, so the same octahedra are not diagonalised
+    three times in one run.
     """
+    with timing.stage(f"spectra: DOS, dressed states and COHP   "
+                      f"(sigma = {sigma:.3f} eV, -> {out_dir}/)"):
+        return _spectral_report(dump, cell, origins, radius, selection, count,
+                                mu, kT, out_dir, sigma, tag, below, above,
+                                models, frontier)
+
+
+def _spectral_report(dump, cell, origins, radius, selection, count, mu, kT,
+                     out_dir, sigma, tag, below, above, models=None,
+                     frontier=None):
     grid = spectral.energy_grid(mu, below=below, above=above, step=0.02)
-    d_rows, p_rows, s_rows = _spectral_sets(dump)
-    print(f"\n{'=' * 72}")
-    print(f"spectral analysis   sigma = {sigma:.3f} eV   ->  {out_dir}/")
-    paths = [_dos_report(dump, grid, mu, sigma, d_rows, p_rows, s_rows,
-                         out_dir, tag)]
+    shells = _shells(dump, origins, selection)
+    paths = [_dos_report(dump, grid, mu, sigma, shells, out_dir, tag)]
 
     # ---- after sub-diagonalisation ---------------------------------
-    models = [local_model.fragment(cell, dump, origin, radius, selection)
-              for origin in origins]
-    columns = [_dressed_columns(dump, model, count) for model in models]
-    curves = _dressed_dos(dump, grid, sigma, columns, origins)   # per cell
-    per_origin = [curve / len(origins) for curve in curves]
+    if models is None:
+        with timing.timed("spectral: fragment models"):
+            models = [local_model.fragment(cell, dump, origin, radius,
+                                           selection)
+                      for origin in origins]
+    with timing.timed("spectral: dressed columns (Loewdin per k)"):
+        columns = [_dressed_columns(dump, model, count) for model in models]
+    with timing.timed("spectral: dressed DOS"):
+        curves = _dressed_dos(dump, grid, sigma, columns, origins)   # per cell
+        per_origin = [curve / len(origins) for curve in curves]
 
     paths.append(plots.spectra(
         grid, mu,
@@ -496,12 +634,16 @@ def spectral_report(dump, cell, origins, radius, selection, count, mu, kT,
           f"   B {spectral.integrate(grid, per_origin[1], mu):5.2f}"
           f"   ligand {spectral.integrate(grid, per_origin[2], mu):5.2f}")
 
-    paths.append(_comparison_report(dump, grid, mu, sigma, columns, models,
-                                    groups, d_rows, p_rows, out_dir, tag))
+    paths.append(timing.timed_call(
+        "spectral: AB/B comparison panel",
+        _comparison_report, dump, grid, mu, sigma, columns, models,
+        groups, shells, out_dir, tag))
 
     # ---- after Loewdin ---------------------------------------------
-    model = local_model.frontier(cell, dump, origins, radius, selection,
-                                 count, mu, kT)
+    if frontier is None:
+        frontier = local_model.frontier(cell, dump, origins, radius, selection,
+                                        count, mu, kT, models=models)
+    model = frontier
     spectra = [spectral.group_dos(dump, grid, sigma, model.columns,
                                   range(position * count, (position + 1) * count))
                for position in range(len(origins))]
@@ -519,8 +661,10 @@ def spectral_report(dump, cell, origins, radius, selection, count, mu, kT,
         spread = np.abs(spectra[0] - spectra[1]).max()
         print(f"  the two origins agree to {spread:.4f} states / eV")
 
-    paths.append(_cohp_report(dump, cell, grid, mu, sigma, columns, origins,
-                              d_rows, p_rows, out_dir, tag))
+    paths.append(timing.timed_call(
+        "spectral: COHP",
+        _cohp_report, dump, cell, grid, mu, sigma, columns, origins,
+        shells, out_dir, tag))
     for path in paths:
         print(f"  saved {path}")
     return paths

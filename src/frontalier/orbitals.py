@@ -126,13 +126,26 @@ def matches(orbital: Orbital, spec: Tuple[Optional[str], Optional[int],
 
 
 def select(orbitals: Sequence[Orbital], specs: Sequence[str]) -> List[int]:
-    """Indices (0-based) of the orbitals matching any of the shell specs."""
-    patterns = [parse_shell(spec) for spec in specs]
-    chosen = [o.index for o in orbitals
-              if any(matches(o, pattern) for pattern in patterns)]
-    if not chosen:
+    """Indices (0-based) of the orbitals matching any of the shell specs.
+
+    `n` in the `.amn` header counts wavefunctions inside the pseudopotential,
+    it is not the principal quantum number (see the module docstring), so the
+    two can disagree: the Fe PAW writes its d channel as `n=5`, and a spec of
+    "Fe 3d" would then match nothing.  When the requested `n` is nowhere in the
+    file, it is dropped and the spec is matched on species and angular momentum
+    alone -- for a species+l pair that is what the user meant anyway.
+    """
+    selected = set()
+    for spec in specs:
+        pattern = parse_shell(spec)
+        hits = [o.index for o in orbitals if matches(o, pattern)]
+        if not hits and pattern[1] is not None:
+            hits = [o.index for o in orbitals
+                    if matches(o, (pattern[0], None, pattern[2]))]
+        selected.update(hits)
+    if not selected:
         raise ValueError(f"orbital selection {list(specs)} matched nothing")
-    return chosen
+    return sorted(selected)          # file order, whichever way they were asked
 
 
 def group_by_atom_shell(orbitals: Sequence[Orbital],

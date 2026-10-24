@@ -26,6 +26,7 @@ from typing import List
 
 import numpy as np
 
+from . import timing
 from .orbitals import Orbital, read_orbitals
 
 
@@ -62,6 +63,39 @@ def _loadtxt(path: str, ncol: int) -> np.ndarray:
     if data.shape[1] != ncol:
         raise ValueError(f"{path}: expected {ncol} columns, found {data.shape[1]}")
     return data
+
+
+def grid_shape(kfrac: np.ndarray, weights: np.ndarray = None) -> tuple:
+    """(n1, n2, n3) of the k mesh, read off the k-points themselves.
+
+    Nothing is assumed to be cubic: a tetragonal 3x3x5 mesh has three different
+    counts, and the number of distinct k values per direction gives them.
+
+    Two conditions have to hold, and the counts alone are not enough: the set
+    must be the full product grid, and every point must carry the same weight.
+    A symmetry-reduced set can have unique counts that multiply to its size by
+    coincidence (48 points of a 7x7x5 mesh look like a 4x4x3 grid) while its
+    weights differ by the multiplicities, and then it is not a mesh whose dual
+    is a box of cells.
+    """
+    counts = tuple(len(np.unique(np.round(kfrac[:, axis], 10)))
+                   for axis in range(3))
+    if int(np.prod(counts)) != len(kfrac):
+        raise ValueError(
+            f"the {len(kfrac)} k-points are not a {counts[0]}x{counts[1]}x"
+            f"{counts[2]} grid -- a symmetry-reduced set cannot be dual to a "
+            f"box of cells, use the full mesh")
+    if weights is not None and not np.allclose(weights, weights[0]):
+        raise ValueError(
+            f"the {len(kfrac)} k-points do not carry equal weights "
+            f"({weights.min():.6f} .. {weights.max():.6f}): the set is "
+            f"symmetry-reduced, so its dual is not a box of cells")
+    return counts
+
+
+def mesh_shape(dump: PwDump) -> tuple:
+    """(n1, n2, n3) of the k mesh of a dump -- see `grid_shape`."""
+    return grid_shape(dump.kfrac, dump.weights)
 
 
 def read_kpoints(path: str):
@@ -104,10 +138,11 @@ def load(prefix: str, spin_degeneracy: int = 2) -> PwDump:
     `spin_degeneracy` is the number of spin channels the weights already carry:
     2 for a non-magnetic run (sum_k w_k = 2 in the file, 1 after normalisation).
     """
-    kfrac, weights = read_kpoints(f"{prefix}.kpt")
-    energies = read_eigenvalues(f"{prefix}.eig")
-    proj = read_projections(f"{prefix}.amn")
-    orbitals = read_orbitals(f"{prefix}.amn")
+    with timing.stage(f"reading the projector dump   ({prefix}.kpt/.eig/.amn)"):
+        kfrac, weights = read_kpoints(f"{prefix}.kpt")
+        energies = read_eigenvalues(f"{prefix}.eig")
+        proj = read_projections(f"{prefix}.amn")
+        orbitals = read_orbitals(f"{prefix}.amn")
 
     if not energies.shape[0] == proj.shape[0] == kfrac.shape[0]:
         raise ValueError(f"{prefix}: k-points disagree between .kpt/.eig/.amn "

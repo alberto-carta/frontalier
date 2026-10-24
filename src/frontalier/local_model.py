@@ -25,7 +25,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from . import fragments, operators
+from . import fragments, operators, timing
 from .fragments import Neighbour
 from .orbitals import Orbital, select
 from .qe_dump import PwDump
@@ -79,16 +79,31 @@ def fragment_states(dump: PwDump, origin_site: int, shell: Sequence[Neighbour],
 
 def fragment_hamiltonian(dump: PwDump,
                          states: Sequence[FragmentState]) -> np.ndarray:
-    """H_{ab} for the fragment, in eV, shape (len(states), len(states))."""
+    """H_{ab} for the fragment, in eV, shape (len(states), len(states)).
+
+    The H(R) blocks are built for the fragment's own orbitals only.  Asking for
+    the full orbital array costs O(norb^2) per R vector instead of O(n_states^2)
+    -- on a 168-orbital cell with 20-atom fragments that is 50x more work for
+    rows and columns that are then thrown away (12 s per fragment instead of
+    0.3 s).
+    """
+    indices = sorted({state.orbital.index for state in states})
+    position = {index: number for number, index in enumerate(indices)}
     offsets = {tuple(int(x) for x in np.subtract(b.image, a.image))
                for a in states for b in states}
-    blocks = {offset: operators.hamiltonian(dump, R=offset) for offset in offsets}
+
+    with timing.timed(f"H(R) blocks, {len(offsets)} offsets x "
+                      f"{len(indices)} orbitals"):
+        blocks = {offset: operators.hamiltonian(dump, R=offset,
+                                               orbital_indices=indices)
+                  for offset in offsets}
 
     matrix = np.zeros((len(states), len(states)), dtype=complex)
     for row, a in enumerate(states):
         for col, b in enumerate(states):
             offset = tuple(int(x) for x in np.subtract(b.image, a.image))
-            matrix[row, col] = blocks[offset][a.orbital.index, b.orbital.index]
+            matrix[row, col] = blocks[offset][position[a.orbital.index],
+                                              position[b.orbital.index]]
     return matrix
 
 
@@ -189,7 +204,8 @@ def overlap(coefficient: np.ndarray, weights: np.ndarray) -> np.ndarray:
     return np.einsum("k,kam,kan->mn", weights, coefficient.conj(), coefficient)
 
 
-def orthonormal_per_k(columns: np.ndarray, tolerance: float = 1e-8) -> np.ndarray:
+def orthonormal_per_k(columns: np.ndarray, tolerance: float = 1e-8,
+                      verbose: bool = True) -> np.ndarray:
     """Loewdin inside each k: U(k) -> U(k) S(k)^{-1/2}, S(k) = U(k)^dag U(k).
 
     This is the only correct way to orthonormalise a set of model states.  The
@@ -201,9 +217,27 @@ def orthonormal_per_k(columns: np.ndarray, tolerance: float = 1e-8) -> np.ndarra
 
     Raises when the set is linearly dependent, which is what happens when the
     fragment grows until its functions stop being independent.
+
+    `verbose` prints the overlap spectrum of every k (default: on when
+    FRONTALIER_TIMING is set).  There is no iteration to follow -- it is one
+    symmetric diagonalisation per k, not a self-consistent step -- so what is
+    worth watching is how far S is from the unit matrix, i.e. how hard the
+    rotation is actually working.
     """
     gram = np.einsum("kma,kmb->kab", columns.conj(), columns)
     values, vectors = np.linalg.eigh(gram)
+    if verbose:
+        spread = values[:, -1] / values[:, 0]
+        print(f"   {gram.shape[0]} rotations of {gram.shape[-1]} states"
+              f"   S eigenvalues {values.min():.6f} .. {values.max():.6f}"
+              f"   worst condition {spread.max():.6f}", flush=True)
+        stride = max(1, len(gram) // 20)
+        for index in range(0, len(gram), stride):
+            print(f"      k {index + 1:4d}   S {values[index, 0]:9.6f} .. "
+                  f"{values[index, -1]:9.6f}   condition {spread[index]:9.6f}",
+                  flush=True)
+        if stride > 1:
+            print(f"      (every {stride}th of {len(gram)} k-points)", flush=True)
     if values.min() <= tolerance * max(values.max(), 1.0):
         raise ValueError(
             f"the {columns.shape[2]} states are linearly dependent at some k "
@@ -251,15 +285,20 @@ def fragment(cell, dump: PwDump, origin: str, radius: float,
     bring the model to a prescribed filling: 1.0 is the octahedron as it comes
     out of the projection, 0.0 switches hybridisation off altogether.
     """
-    shell = fragments.coordination_shell(cell, origin, radius)
-    origin_site = fragments.resolve_atoms(cell, [origin])[0] + 1
-    states = fragment_states(dump, origin_site, shell, selection)
-    hamiltonian = fragment_hamiltonian(dump, states)
-    if coupling is not None:
-        shell_of = np.array([state.orbital.shell for state in states])
-        between = shell_of[:, None] != shell_of[None, :]
-        hamiltonian = hamiltonian * np.where(between, coupling, 1.0)
-    eigenvalues, eigenvectors = diagonalise(hamiltonian)
+    with timing.stage(f"identifying the fragment of {origin}"
+                      f"   (radius {radius} A, {list(selection)})"):
+        shell = fragments.coordination_shell(cell, origin, radius)
+        origin_site = fragments.resolve_atoms(cell, [origin])[0] + 1
+        with timing.timed(f"fragment {origin}: basis"):
+            states = fragment_states(dump, origin_site, shell, selection)
+        with timing.timed(f"fragment {origin}: H(R) blocks"):
+            hamiltonian = fragment_hamiltonian(dump, states)
+        if coupling is not None:
+            shell_of = np.array([state.orbital.shell for state in states])
+            between = shell_of[:, None] != shell_of[None, :]
+            hamiltonian = hamiltonian * np.where(between, coupling, 1.0)
+        with timing.timed(f"fragment {origin}: diagonalise"):
+            eigenvalues, eigenvectors = diagonalise(hamiltonian)
     return Fragment(origin=origin, radius=radius, selection=list(selection),
                     shell=shell, states=states, hamiltonian=hamiltonian,
                     eigenvalues=eigenvalues, eigenvectors=eigenvectors)
@@ -286,7 +325,9 @@ class Frontier:
 def frontier(cell, dump: PwDump, origins: Sequence[str], radius: float,
              selection: Sequence[str], count: int,
              mu: float, kT: float,
-             coupling: Optional[float] = None) -> Frontier:
+             coupling: Optional[float] = None,
+             verbose: bool = True,
+             models: Optional[Sequence["Fragment"]] = None) -> Frontier:
     """Lowdin-orthonormalised model of the `count` highest states per origin.
 
     The states of different origins overlap (they share ligand orbitals), so
@@ -295,26 +336,45 @@ def frontier(cell, dump: PwDump, origins: Sequence[str], radius: float,
     right, and `operators` does the rest.  No real-space matrix is rotated.
 
     `coupling` is passed to `fragment`; leave it alone for the octahedron as it
-    comes out of the projection.
+    comes out of the projection.  `models` are fragments already built (in the
+    order of `origins`), so a driver that prints them does not build them a
+    second time here.
     """
-    columns, levels = [], []
-    for origin in origins:
-        model = fragment(cell, dump, origin, radius, selection, coupling)
-        energies, _, chosen = highest_states(model.eigenvalues,
-                                             model.eigenvectors, count)
-        columns.append(bloch_columns(model.states, model.eigenvectors, chosen,
-                                     dump.kfrac, dump.norb))
-        levels.append(energies)
-
-    combined = np.concatenate(columns, axis=2)          # (nk, norb, n_origins*count)
-    overlap_matrix = overlap(combined, dump.weights)
-    rotated = orthonormal_per_k(combined)
+    with timing.stage(f"Loewdin orthonormalisation   ({len(origins)} origins"
+                      f" x {count} states)"):
+        columns, levels = _frontier_columns(cell, dump, origins, radius,
+                                            selection, count, coupling, models)
+        combined = np.concatenate(columns, axis=2)   # (nk, norb, origins*count)
+        with timing.timed("frontier: overlap S (k-averaged)"):
+            overlap_matrix = overlap(combined, dump.weights)
+        with timing.timed("frontier: Loewdin, one rotation per k"):
+            rotated = orthonormal_per_k(combined, verbose=verbose)
+        with timing.timed("frontier: Hloc"):
+            hloc = operators.hamiltonian(dump, transform=rotated)
+        with timing.timed("frontier: n_occ"):
+            nocc = operators.density_matrix(dump, mu, kT, transform=rotated)
 
     return Frontier(origins=list(origins), count=count,
                     selection=list(selection),
                     levels=np.concatenate(levels),
                     overlap=overlap_matrix,
                     columns=rotated,
-                    hloc=operators.hamiltonian(dump, transform=rotated),
-                    nocc=operators.density_matrix(dump, mu, kT,
-                                                  transform=rotated))
+                    hloc=hloc, nocc=nocc)
+
+
+def _frontier_columns(cell, dump, origins, radius, selection, count, coupling,
+                      models=None):
+    """The Bloch columns of the `count` highest states of every origin."""
+    if models is None:
+        with timing.timed(f"frontier: {len(origins)} fragment(s)"):
+            models = [fragment(cell, dump, origin, radius, selection, coupling)
+                      for origin in origins]
+    columns, levels = [], []
+    for model in models:
+        energies, _, chosen = highest_states(model.eigenvalues,
+                                             model.eigenvectors, count)
+        with timing.timed(f"frontier {model.origin}: Bloch columns"):
+            columns.append(bloch_columns(model.states, model.eigenvectors,
+                                         chosen, dump.kfrac, dump.norb))
+        levels.append(energies)
+    return columns, levels

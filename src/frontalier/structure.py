@@ -30,15 +30,72 @@ import re
 from pymatgen.core import Structure
 from pymatgen.io.pwscf import PWInput
 
+from . import timing
+
 
 def _normalise(text: str) -> str:
     """Make a QE input acceptable to pymatgen (see the module docstring)."""
-    text = re.sub(r"(ATOMIC_POSITIONS)\s+(\w+)", r"\1 {\2}", text)
-    text = re.sub(r"(CELL_PARAMETERS)\s*\((\w+)\)", r"\1 {\2}", text)
-    text = re.sub(r"(K_POINTS)\s+(\w+)", r"\1 {\2}", text)
+    text = _resolve_alat(text)
+    text = _braced_modes(text)
     text = re.sub(r"(?<![\d.])-?\.(\d)",
                   lambda m: m.group(0).replace(".", "0."), text)
     return _cell_before_positions(_replace_kpoints(text))
+
+
+BOHR_TO_ANGSTROM = 0.529177210903
+
+#  CELL_PARAMETERS (alat= 7.26120000)  +  the three rows that follow it
+_ALAT_CARD = re.compile(
+    r"^([ \t]*)CELL_PARAMETERS[ \t]*\([ \t]*alat[ \t]*=[ \t]*"
+    r"([-+]?[\d.]+(?:[eEdD][-+]?\d+)?)[ \t]*\)[^\n]*\n"
+    r"([^\n]*)\n([^\n]*)\n([^\n]*)\n",
+    re.MULTILINE | re.IGNORECASE)
+
+
+def _qe_float(text: str) -> float:
+    """A QE number, which may carry a Fortran `d` exponent."""
+    return float(text.replace("d", "e").replace("D", "E"))
+
+
+def _resolve_alat(text: str) -> str:
+    """Rewrite `CELL_PARAMETERS (alat=X)` as explicit Angstrom rows.
+
+    QE reads the three numbers in units of `X` Bohr; pymatgen ignores the
+    factor and would build a cell that is `X` bhor too small -- the SrVO3 input
+    came out with a = 1.0044 A instead of 3.8596 A, quietly.  The conversion is
+    done here and the card becomes `{angstrom}`, which also stops
+    `_braced_modes` from mangling the `=` sign.
+    """
+    def repl(match):
+        indent, scale = match.group(1), _qe_float(match.group(2))
+        scale *= BOHR_TO_ANGSTROM
+        rows = []
+        for group in (3, 4, 5):
+            values = [_qe_float(value) * scale for value in match.group(group).split()]
+            rows.append(f"{indent}  {values[0]:18.10f}{values[1]:18.10f}"
+                        f"{values[2]:18.10f}")
+        return f"{indent}CELL_PARAMETERS {{angstrom}}\n" + "\n".join(rows) + "\n"
+
+    return _ALAT_CARD.sub(repl, text)
+
+
+#  the cards whose mode pymatgen only accepts in braces
+MODE_CARDS = ("ATOMIC_POSITIONS", "CELL_PARAMETERS", "K_POINTS")
+
+
+def _braced_modes(text: str) -> str:
+    """`CARD mode`, `CARD (mode)` and `CARD {mode}` all become `CARD {mode}`.
+
+    QE accepts the three spellings, pymatgen only the braced one: a bare
+    `CELL_PARAMETERS angstrom` is what made it raise IndexError on the FeO
+    input.  Only letters and underscores are taken as a mode, so a card whose
+    mode is omitted altogether (QE then means alat) is left alone.
+    """
+    for card in MODE_CARDS:
+        text = re.sub(
+            rf"^([ \t]*{card})[ \t]*[\(\{{]?[ \t]*([A-Za-z_]+)[ \t]*[\)\}}]?",
+            r"\1 {\2}", text, flags=re.MULTILINE)
+    return text
 
 
 def _replace_kpoints(text: str) -> str:
@@ -80,5 +137,6 @@ def _cell_before_positions(text: str) -> str:
 
 def read_structure(pw_input_path: str) -> Structure:
     """pymatgen Structure of the cell described by a pw input file."""
-    with open(pw_input_path) as fh:
-        return PWInput.from_string(_normalise(fh.read())).structure
+    with timing.stage(f"reading the structure   ({pw_input_path})"):
+        with open(pw_input_path) as fh:
+            return PWInput.from_string(_normalise(fh.read())).structure

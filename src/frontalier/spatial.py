@@ -32,7 +32,7 @@ from typing import Sequence
 import numpy as np
 from pymatgen.core import Structure
 
-from .qe_dump import PwDump
+from .qe_dump import PwDump, mesh_shape
 
 DEFAULT_EDGES = (0.6, 2.5, 3.6, 5.2)
 
@@ -41,15 +41,12 @@ def mesh_cells(dump: PwDump) -> np.ndarray:
     """The lattice translations dual to the k mesh, shape (nk, 3).
 
     A Fourier transform on the mesh cannot tell apart cells that differ by a
-    mesh vector, so the mesh itself is the complete set of atom images.
-    Requires the same number of points in each direction.
+    mesh vector, so the mesh itself is the complete set of atom images.  The
+    three directions are counted separately, so a 3x3x5 tetragonal mesh gives
+    45 cells and not a cube.
     """
-    side = int(round(dump.nk ** (1.0 / 3.0)))
-    if side ** 3 != dump.nk:
-        raise ValueError(f"the k mesh has {dump.nk} points, "
-                         f"which is not a cube -- no dual cell list")
-    grid = np.arange(side)
-    return np.array(list(itertools.product(grid, grid, grid)))
+    shape = mesh_shape(dump)
+    return np.array(list(itertools.product(*(range(n) for n in shape))))
 
 
 def orbital_coefficients(dump: PwDump, amplitudes: np.ndarray) -> np.ndarray:

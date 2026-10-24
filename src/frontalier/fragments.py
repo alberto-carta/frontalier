@@ -62,14 +62,61 @@ def atom_names(structure: Structure) -> List[str]:
     return [f"{site.specie}{index}" for index, site in enumerate(structure, start=1)]
 
 
+def expand_atoms(structure: Structure, names: List[str]) -> List[str]:
+    """Expand a species name into the labels of its atoms, when it is ambiguous.
+
+    'Ti' in a cell with four Ti becomes ['Ti5', 'Ti6', 'Ti7', 'Ti8'], so a
+    driver can ask for "every Ti" without spelling the labels out.  A name that
+    is already a label ('Ni1') or a species with a single atom ('Fe') comes
+    back unchanged, so nothing downstream has to know about this.
+    """
+    labels = atom_names(structure)
+    known = set(labels)
+    by_species: Dict[str, List[str]] = {}
+    for index, site in enumerate(structure):
+        by_species.setdefault(str(site.specie), []).append(labels[index])
+
+    expanded: List[str] = []
+    for name in names:
+        if name in known:
+            expanded.append(name)
+        elif name in by_species and len(by_species[name]) > 1:
+            expanded.extend(by_species[name])
+        elif name in by_species:
+            expanded.append(name)
+        else:
+            raise ValueError(f"no atom(s) {[name]} in the cell; "
+                             f"available: {labels}")
+    return expanded
+
+
 def resolve_atoms(structure: Structure, names: List[str]) -> List[int]:
-    """Turn atom names into 0-based site indices."""
-    table = {name: index for index, name in enumerate(atom_names(structure))}
-    missing = [name for name in names if name not in table]
-    if missing:
-        raise ValueError(f"no atom(s) {missing} in the cell; "
-                         f"available: {list(table)}")
-    return [table[name] for name in names]
+    """Turn atom names into 0-based site indices.
+
+    A name is either a full label ("Ni1", "O3") or, when the cell holds exactly
+    one atom of that species, the bare species ("Fe").  The short form is what
+    one writes for a small cell, and it is unambiguous there.
+    """
+    labels = atom_names(structure)
+    table = {name: index for index, name in enumerate(labels)}
+    by_species: Dict[str, List[int]] = {}
+    for index, site in enumerate(structure):
+        by_species.setdefault(str(site.specie), []).append(index)
+
+    resolved = []
+    for name in names:
+        if name in table:
+            resolved.append(table[name])
+        elif len(by_species.get(name, [])) == 1:
+            resolved.append(by_species[name][0])
+        elif name in by_species:
+            raise ValueError(
+                f"{name} is ambiguous: the cell holds {len(by_species[name])} "
+                f"of it, pick one of {[labels[i] for i in by_species[name]]}")
+        else:
+            raise ValueError(f"no atom(s) {[name]} in the cell; "
+                             f"available: {labels}")
+    return resolved
 
 
 def coordination_shell(structure: Structure, name: str,
